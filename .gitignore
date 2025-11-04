@@ -42,7 +42,7 @@ logs/
 **/Release/
 **/build/
 **/cmake-build*/
-/stm32_controller/.metadata/
+**/.metadata/
 # Archivos temporales de CubeMX/IDE que no aportan
 **/.settings/
 **/*.launch

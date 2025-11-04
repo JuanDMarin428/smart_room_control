@@ -95,8 +95,12 @@ static const float Q_person = 75.0f;    // W/person
 static const float G_w      = 1.1e-5f;  // kg/s/person
 static const float gamma_c  = 0.1f;     // ppm/s/person
 
-static inline float q_flow(float uf, float T, float To){
-    return q_max * clampf(uf,0,1) + k_stack*(T - To);
+static const float heater_scale = 1.0f; //Depends on python test
+static const float fan_scale = 1.0f;	//Depends on python test
+
+
+float q_flow(float uf, float T, float To){
+    return (q_max * fan_scale) * clampf(uf, 0, 1) + k_stack * (T - To);
 }
 
 static volatile bool g_send_kf_frames = true;
@@ -150,7 +154,7 @@ static void on_meas_cb(const meas_packet_t *m) {
 
     /* dfdu, u=[uh, uf] */
     float dfdu[3][2] = {0};
-    dfdu[0][0] = (eta_h*Ph)/(rho*cp*V);
+    dfdu[0][0] = (eta_h * Ph * heater_scale) / (rho * cp * V);
     float kv = (q_max)/V;   /* dq/duf scaled by volume */
     dfdu[0][1] = kv*(To - T);
     dfdu[1][1] = kv*(wo - w);

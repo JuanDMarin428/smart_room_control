@@ -26,6 +26,8 @@
 #include "comms.h"
 #include "uart_parser.h"
 #include <stdio.h>
+#include "kalman3.h"
+#include "kalman1d.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,6 +59,7 @@ const osThreadAttr_t defaultTask_attributes = {
 /* USER CODE BEGIN PV */
 
 volatile meas_packet_t g_last_meas;
+volatile meas_packet_t g_filt_meas;
 volatile uint32_t      g_meas_seq = 0;
 volatile uint32_t      g_last_meas_tick = 0;
 volatile uint32_t      g_last_meas_age_ms = 0;
@@ -77,18 +80,122 @@ void StartDefaultTask(void *argument);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 static comms_t comms;
+static kf3_t  kf;
+static kf1d_t kfN;
+static uint32_t last_kf_tick = 0;
+
+static const float V      = 50.0f;      // m^3
+static const float rho    = 1.2f;       // kg/m^3
+static const float cp     = 1005.0f;    // J/kg/°C
+static const float Ph     = 1500.0f;    // W
+static const float eta_h  = 0.95f;      // -
+static const float q_max  = 0.056f;     // m^3/s
+static const float k_stack= 0.002f;     // m^3/(s·°C)
+static const float Q_person = 75.0f;    // W/person
+static const float G_w      = 1.1e-5f;  // kg/s/person
+static const float gamma_c  = 0.1f;     // ppm/s/person
+
+static inline float q_flow(float uf, float T, float To){
+    return q_max * clampf(uf,0,1) + k_stack*(T - To);
+}
 
 static void on_meas_cb(const meas_packet_t *m) {
-	g_last_meas = *m;
-	g_meas_seq++;
-	g_last_meas_tick = HAL_GetTick();
+    g_last_meas = *m;
 
-	char msg[128];
-	int n = snprintf(msg, sizeof(msg),
-					 "Parsed MEAS: T=%.2f, w=%.6f, c=%.1f, N=%.0f\r\n",
-					 m->T, m->w, m->c, m->N);
-	HAL_UART_Transmit(&huart3, (uint8_t*)msg, n, HAL_MAX_DELAY);
+    // 1) dt desde último MEAS
+    uint32_t now = HAL_GetTick();
+    float dt = (now - last_kf_tick) * 0.001f;            // [s]
+    if (dt < 1e-3f) dt = 1e-3f; if (dt > 60.0f) dt = 60.0f;
+    last_kf_tick = now;
+
+    // 2) Entradas y disturbios (usa tus últimas consignas reales)
+    //    Aquí pongo ctrl fijo por simplicidad; usa tus variables reales uh/uf.
+    float u[2] = { 0.5f, 0.25f };      // [u_h, u_f] (reemplaza por actuales)
+    float To = 10.0f, wo = 0.004f, co = 420.0f; // reemplaza si tienes medición real
+
+    // N filtrado (usa medición actual m->N como zN)
+    float Nhat = kf1d_update(&kfN, m->N);
+    float d[4] = { To, wo, co, Nhat };
+
+    // 3) Construir A,B,E alrededor del estado estimado actual kf.x
+    const float T = kf.x[0], w = kf.x[1], c = kf.x[2];
+    float q = q_flow(u[1], T, To);
+    float alpha = q / V;
+    float beta  = k_stack / V;
+
+    // dfdx
+    float dfdx[3][3] = {
+        { -alpha + beta*(To - T),  0.0f,                   0.0f },
+        {  beta*(wo - w),         -alpha,                 0.0f },
+        {  beta*(co - c),          0.0f,                 -alpha }
+    };
+
+    // dfdu (u=[uh, uf])
+    float dfdu[3][2] = {0};
+    dfdu[0][0] = (eta_h*Ph)/(rho*cp*V); // efecto del heater en T
+    float kv = (q_max)/V;               // derivada de q respecto a uf
+    dfdu[0][1] = kv*(To - T);
+    dfdu[1][1] = kv*(wo - w);
+    dfdu[2][1] = kv*(co - c);
+
+    // dfdd (d=[To, wo, co, N])
+    float dfdd[3][4] = {0};
+    dfdd[0][0] =  alpha - beta*(To - T);
+    dfdd[1][0] = -beta*(wo - w);
+    dfdd[2][0] = -beta*(co - c);
+    dfdd[1][1] =  alpha;
+    dfdd[2][2] =  alpha;
+    dfdd[0][3] = (Q_person)/(rho*cp*V);
+    dfdd[1][3] = (G_w)/(rho*V);
+    dfdd[2][3] = gamma_c;
+
+    // A = I + dt*dfdx ; B = dt*dfdu ; E = dt*dfdd
+    float A[3][3] = {
+        {1.0f + dt*dfdx[0][0], dt*dfdx[0][1],            dt*dfdx[0][2]},
+        {dt*dfdx[1][0],        1.0f + dt*dfdx[1][1],     dt*dfdx[1][2]},
+        {dt*dfdx[2][0],        dt*dfdx[2][1],            1.0f + dt*dfdx[2][2]}
+    };
+    float B[3][2] = {
+        {dt*dfdu[0][0], dt*dfdu[0][1]},
+        {dt*dfdu[1][0], dt*dfdu[1][1]},
+        {dt*dfdu[2][0], dt*dfdu[2][1]}
+    };
+    float E[3][4] = {
+        {dt*dfdd[0][0], dt*dfdd[0][1], dt*dfdd[0][2], dt*dfdd[0][3]},
+        {dt*dfdd[1][0], dt*dfdd[1][1], dt*dfdd[1][2], dt*dfdd[1][3]},
+        {dt*dfdd[2][0], dt*dfdd[2][1], dt*dfdd[2][2], dt*dfdd[2][3]}
+    };
+
+    // 4) Kalman: predicción y actualización con z = [T,w,c] medidos
+    float z[3] = { m->T, m->w, m->c };
+    if (!kf.inited) {
+        float x0[3] = { z[0], z[1], z[2] };
+        float Rdiag[3] = { 0.01f, 1e-8f, 400.0f };
+        float Qdiag[3] = { 4e-4f, 1e-8f, 25.0f };
+        kf3_init(&kf, x0, 1.0f, Qdiag, Rdiag);
+    } else {
+        kf3_predict(&kf, A, B, u, E, d);
+        kf3_update(&kf, z);
+    }
+
+    // 5) Publica filtrado
+    g_filt_meas.T = kf.x[0];
+    g_filt_meas.w = kf.x[1];
+    g_filt_meas.c = kf.x[2];
+    g_filt_meas.N = Nhat;
+
+    g_last_meas_tick = now;
+    g_meas_seq++;
+
+    // (Opcional) log
+    char msg[192];
+    int n = snprintf(msg, sizeof(msg),
+        "MEAS T=%.3f w=%.6f c=%.1f N=%.0f | KF T=%.3f w=%.6f c=%.1f N=%.2f\r\n",
+        m->T, m->w, m->c, m->N,
+        g_filt_meas.T, g_filt_meas.w, g_filt_meas.c, g_filt_meas.N);
+    if (n>0) HAL_UART_Transmit(&huart3, (uint8_t*)msg, (uint16_t)n, HAL_MAX_DELAY);
 }
+
 
 /* USER CODE END 0 */
 
@@ -129,6 +236,13 @@ int main(void)
   // const char *hello = "STM32F767ZI UART3 via ST-LINK VCP (PD8/PD9) OK\r\n";
   // HAL_UART_Transmit(&huart3, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
   comms_init(&comms, &huart3, on_meas_cb);
+
+  float x0[3] = {20.0f, 0.006f, 800.0f};
+  float Rdiag[3] = { 0.10f*0.10f, 1e-4f*1e-4f, 20.0f*20.0f }; // [T,w,c]
+  float Qdiag[3] = { 4e-4f, 1e-8f, 25.0f };
+  kf3_init(&kf, x0, 1.0f, Qdiag, Rdiag);
+  kf1d_init(&kfN, 2.0f, 1.0f, 1e-6f, 1e-2f); // N casi constante, ruido chico
+  last_kf_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Init scheduler */

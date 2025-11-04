@@ -4,14 +4,13 @@
 ---
 
 ## 📘 Overview
-This project implements a **closed-loop environmental control system** for a single room.
-It combines **a simulated plant in Python** with a **real embedded controller (STM32F767ZI)**.
-The goal is to regulate **temperature**, **humidity**, and **CO₂ concentration** using:
-- A **heater (PWM-controlled)**, and  
-- A **ventilation fan (PWM-controlled)**.
+This project implements a **closed-loop environmental control system** for a single room.  
+It combines a **simulated plant in Python** with a **real embedded controller (STM32F767ZI)**.  
+The objective is to regulate **temperature**, **humidity**, and **CO₂ concentration** using:  
+- A **heater (PWM-controlled)**  
+- A **ventilation fan (PWM-controlled)**  
 
-Both systems communicate over **UART (USB Virtual COM Port)**.
-A **graphical user interface (GUI)** in Python allows visualization and adjustment of setpoints in real-time.
+Both systems communicate via **UART (USB Virtual COM Port)**.  
 
 ---
 
@@ -19,13 +18,13 @@ A **graphical user interface (GUI)** in Python allows visualization and adjustme
 ```
           ┌────────────────────────────┐
           │        Python Plant        │
-          │ (Simulation + GUI + UART)  │
+          │  (Simulation + UART I/O)   │
           └────────────┬───────────────┘
                        │ UART (USB)
                        ▼
           ┌────────────────────────────┐
           │       STM32F767ZI MCU      │
-          │ (Kalman Filter + MPC)      │
+          │ (Kalman Filter + Control)  │
           └────────────────────────────┘
 ```
 
@@ -34,10 +33,9 @@ A **graphical user interface (GUI)** in Python allows visualization and adjustme
 ## 🧩 Components
 | Module | Description |
 |--------|-------------|
-| `python_plant/` | Simulated environment, UART communication, and GUI. |
-| `stm32_controller/` | STM32 firmware with Kalman Filter + MPC. |
-| `docs/latex/` | Overleaf-ready LaTeX documentation (main.tex + references). |
-| `utils/` | Auxiliary scripts for calibration and testing. |
+| `python_plant/` | Python-based plant simulation and UART communication with STM32. |
+| `stm32_controller/smart_room_control_v1/` | STM32 firmware with Kalman filter and closed-loop control. |
+| `docs/` | Documentation and detailed modeling report. |
 
 ---
 
@@ -50,7 +48,7 @@ x =
 T \\ w \\ c
 \end{bmatrix}
 \]
-where:
+where:  
 - \( T \) [°C]: Room air temperature  
 - \( w \) [kg/kg]: Absolute humidity  
 - \( c \) [ppm]: CO₂ concentration  
@@ -63,7 +61,7 @@ u_h \\ u_f
 \end{bmatrix}
 \]
 - \( u_h \): Heater PWM  
-- \( u_f \): Fan PWM
+- \( u_f \): Fan PWM  
 
 Disturbances:
 \[
@@ -82,7 +80,7 @@ Continuous-time dynamics:
 \end{aligned}
 \]
 
-where:
+where:  
 \( q = q_{max}u_f + k_{stack}(T - T_o) \)
 
 ---
@@ -93,30 +91,46 @@ where:
 | Simulation | Python (NumPy, Matplotlib, PySerial) |
 | Control | STM32CubeIDE (C with CMSIS/FreeRTOS optional) |
 | Communication | UART (115200 bps, ASCII packets) |
-| GUI | Streamlit / Tkinter / PyQt5 |
-| Documentation | Overleaf (LaTeX) |
+| Documentation | LaTeX / PDF report |
 
 ---
 
 ## 🧠 Control Algorithms
-- **Kalman Filter:** Estimates hidden states (humidity, CO₂) from noisy sensors.  
-- **Model Predictive Control (MPC):** Minimizes cost function to reach setpoints with constraints on PWM.
+- **Kalman Filter:** Estimates states (Temp, humidity and CO₂) from noisy measurements.  
+- **Closed-loop control:** Applies heater and fan actuation to maintain setpoints.  
 
 ---
 
 ## 🔌 Communication Protocol
-**Packet format (ASCII via UART):**
+**Packet format (ASCII via UART):**  
 - Python → STM32: `<MEAS, T, w, c, N>`  
 - STM32 → Python: `<CTRL, uh, uf>`
 
-**Example:**
+**Example:**  
 ```
 <MEAS, 22.4, 0.0062, 750, 2>
 <CTRL, 0.45, 0.70>
 ```
 
 **Baud rate:** 115200 bps  
-**Data bits:** 8, **Stop bits:** 1, **Parity:** None
+**Data bits:** 8, **Stop bits:** 1, **Parity:** None  
+
+---
+
+## 🚀 Running the Simulation
+
+### Command used for the online simulation
+```bash
+python python_plant/main.py --mode online --port COM11 --baud 115200 --Ts 0.01 --duration 10 --sim-speed 10 --noise-mult-T 20 --noise-mult-w 2 --noise-mult-c 20 --heater-scale 5 --fan-scale 20
+```
+
+This configuration corresponds to a **real-time experiment** with the STM32F767ZI controller.  
+
+---
+
+## 📊 Results and Documentation
+All results, conclusions, and detailed mathematical modeling are available in:  
+📄 `docs/smart_control_room.pdf`  
 
 ---
 
@@ -125,80 +139,32 @@ where:
 smart-room-control/
 │
 ├── README.md
-├── CHECKLIST.md
-├── .gitignore
 │
 ├── docs/
-│   ├── latex/
-│   │   ├── main.tex
-│   │   ├── references.bib
-│   │   └── figures/
-│   └── diagrams/
+│   └── smart_control_room.pdf
 │
 ├── python_plant/
 │   ├── main.py
 │   ├── model.py
-│   ├── comms.py
-│   ├── gui/
-│   │   ├── app.py
-│   │   └── assets/
-│   └── logs/
+│   └── comms.py
 │
-├── stm32_controller/
-│   ├── Core/
-│   ├── Drivers/
-│   ├── Middlewares/
-│   └── README.md
-│
-└── utils/
-    ├── calibration/
-    └── testing/
+└── stm32_controller/
+    └── smart_room_control_v1/
 ```
 
 ---
 
-## 🚀 Getting Started
-### 1️⃣ Clone the repository
-```bash
-git clone https://github.com/<your-username>/smart-room-control.git
-cd smart-room-control
-```
-
-### 2️⃣ Run the Python plant
-```bash
-cd python_plant
-python3 main.py
-```
-
-### 3️⃣ Flash STM32 firmware
-Compile and upload firmware from `stm32_controller/` using STM32CubeIDE.
-
-### 4️⃣ Start the GUI
-```bash
-cd python_plant/gui
-streamlit run app.py
-```
-
----
-
-## 🧪 Testing Procedure
-1. Run Python plant and GUI.  
-2. Connect STM32 board via USB.  
-3. Verify UART data exchange.  
-4. Observe temperature and CO₂ tracking.  
-5. Adjust MPC weights and noise parameters.
-
----
-
-## 📚 Documentation
-Full modeling and theoretical details are available in `docs/latex/main.tex` (Overleaf project).
+## 🧪 Future Work
+- Test and validate **varying occupancy scenarios (N variable)**.  
+- Extend system to include **humidity and CO₂ actuators**.  
+- Evaluate **long-term performance and energy efficiency**.  
 
 ---
 
 ## 🧑‍💻 Author
 **Juan Marin**  
 Control Engineer / Embedded Developer  
-juandiegomarin428@gmail.com
+📧 juandiegomarin428@gmail.com  
 
 ---
 

@@ -95,9 +95,8 @@ static const float Q_person = 75.0f;    // W/person
 static const float G_w      = 1.1e-5f;  // kg/s/person
 static const float gamma_c  = 0.1f;     // ppm/s/person
 
-static const float heater_scale = 1.0f; //Depends on python test
-static const float fan_scale = 1.0f;	//Depends on python test
-
+static const float heater_scale = 5.0f; //Depends on python test
+static const float fan_scale = 20.0f;	//Depends on python test
 
 float q_flow(float uf, float T, float To){
     return (q_max * fan_scale) * clampf(uf, 0, 1) + k_stack * (T - To);
@@ -105,6 +104,95 @@ float q_flow(float uf, float T, float To){
 
 static volatile bool g_send_kf_frames = true;
 static inline void set_send_kf_frames(bool enable) { g_send_kf_frames = enable; }
+
+
+
+/* ---- Control setpoints (can be updated later via UART if desired) ------- */
+static volatile float T_ref = 21.0f;     /* °C */
+static volatile float w_ref = 0.0060f;   /* kg/kg absolute humidity */
+static volatile float c_ref = 800.0f;    /* ppm CO2 */
+
+/* ---- Controller gains (starting points; tune on your rig) --------------- */
+/* Temperature → heater (uh) */
+static float Kp_T  = 0.80f;
+static float Ki_T  = 0.05f;    /* [1/s] */
+static float K_aw_T = 0.5f;    /* anti-windup back-calculation */
+
+/* Ventilation → fan (uf), combining humidity & CO2 */
+static float Kw_w  = 0.7f;     /* weight for humidity error */
+static float Kw_c  = 0.3f;     /* weight for CO2 error */
+static float Kp_F  = 2.0f;
+static float Ki_F  = 0.10f;    /* [1/s] */
+static float K_aw_F = 0.5f;    /* anti-windup back-calculation */
+
+/* Output limits and simple per-step rate limits */
+static const float UH_MIN = 0.0f, UH_MAX = 1.0f;
+static const float UF_MIN = 0.0f, UF_MAX = 1.0f;
+static const float UH_RATE = 0.10f;      /* max Δuh per control step */
+static const float UF_RATE = 0.20f;      /* max Δuf per control step */
+
+/* ---- PI controller state ------------------------------------------------ */
+typedef struct {
+    float uh, uf;   /* current outputs */
+    float I_T;      /* integrator for temperature loop */
+    float I_F;      /* integrator for ventilation loop */
+} ctrl_state_t;
+
+static ctrl_state_t g_ctrl = { .uh = 0.5f, .uf = 0.25f, .I_T = 0.0f, .I_F = 0.0f };
+
+/**
+ * @brief Combine humidity and CO2 into a single ventilation error.
+ *        Rough normalization prevents unit dominance.
+ *
+ * Sign convention:
+ *  - If w_hat < w_ref → positive e_w → tends to *reduce* ventilation.
+ *  - If c_hat > c_ref → positive e_c → tends to *increase* ventilation.
+ */
+static inline float ventilation_error(float w_hat, float c_hat) {
+    float e_w = (w_ref - w_hat) / 0.0020f;  /* ~2 g/kg typical indoor span */
+    float e_c = (c_hat - c_ref) / 400.0f;   /* ~±400 ppm typical span */
+    return (Kw_w * e_w) + (Kw_c * e_c);
+}
+
+/**
+ * @brief One control step: PI(uh) for temperature and PI(uf) for ventilation.
+ * @param dt      Control step (seconds)
+ * @param T_hat   Estimated temperature
+ * @param w_hat   Estimated absolute humidity
+ * @param c_hat   Estimated CO2
+ * @param out     Output control packet (uh, uf saturated & rate-limited)
+ */
+static void control_step(float dt, float T_hat, float w_hat, float c_hat, ctrl_packet_t *out) {
+    /* --- Temperature loop → uh (PI + anti-windup) --- */
+    float eT = (T_ref - T_hat);
+    float uh_unsat = Kp_T * eT + g_ctrl.I_T;
+    float uh_cmd   = clampf(uh_unsat, UH_MIN, UH_MAX);
+    /* back-calculation anti-windup */
+    g_ctrl.I_T += (Ki_T * eT + K_aw_T * (uh_cmd - uh_unsat)) * dt;
+
+    /* Rate limit */
+    float d_uh = uh_cmd - g_ctrl.uh;
+    if (d_uh >  UH_RATE) d_uh =  UH_RATE;
+    if (d_uh < -UH_RATE) d_uh = -UH_RATE;
+    g_ctrl.uh = clampf(g_ctrl.uh + d_uh, UH_MIN, UH_MAX);
+
+    /* --- Ventilation loop → uf (PI on combined error) --- */
+    float eF = ventilation_error(w_hat, c_hat);
+    float uf_unsat = Kp_F * eF + g_ctrl.I_F;
+    float uf_cmd   = clampf(uf_unsat, UF_MIN, UF_MAX);
+    g_ctrl.I_F += (Ki_F * eF + K_aw_F * (uf_cmd - uf_unsat)) * dt;
+
+    /* Rate limit */
+    float d_uf = uf_cmd - g_ctrl.uf;
+    if (d_uf >  UF_RATE) d_uf =  UF_RATE;
+    if (d_uf < -UF_RATE) d_uf = -UF_RATE;
+    g_ctrl.uf = clampf(g_ctrl.uf + d_uf, UF_MIN, UF_MAX);
+
+    /* Return control packet */
+    out->uh = g_ctrl.uh;
+    out->uf = g_ctrl.uf;
+}
+
 
 /**
  * @brief Measurement callback: linearize model, run 3-state KF, publish filtered values,
@@ -464,20 +552,41 @@ void StartDefaultTask(void *argument)
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
 
-  ctrl_packet_t ctrl = {.uh = 0.5f, .uf = 0.25f};
+  ctrl_packet_t ctrl = { .uh = 0.5f, .uf = 0.25f };
 
-  for(;;)
-  {
-	  comms_poll(&comms);
+  const uint32_t Ts_ms = 100;                 /* 10 Hz control */
+  uint32_t last_ctrl = osKernelGetTickCount();
 
-	  static uint32_t last = 0;
-	  uint32_t now = osKernelGetTickCount();
-	  if (now - last > 5000) {
-		  last = now;
-		  comms_send_ctrl(&comms, &ctrl);
-	  }
-	  g_last_meas_age_ms = now - g_last_meas_tick;
-	  osDelay(10);
+  for (;;) {
+      comms_poll(&comms);
+
+      uint32_t now = osKernelGetTickCount();
+      g_last_meas_age_ms = now - g_last_meas_tick;
+
+      /* Periodic control step */
+      if ((now - last_ctrl) >= Ts_ms) {
+          float dt = (now - last_ctrl) * 0.001f;
+          if (dt < 1e-3f) dt = 1e-3f;
+          last_ctrl = now;
+
+          /* Use KF estimates (latest available) */
+          float T_hat = g_filt_meas.T;
+          float w_hat = g_filt_meas.w;
+          float c_hat = g_filt_meas.c;
+
+          control_step(dt, T_hat, w_hat, c_hat, &ctrl);
+
+          /* Send control every step */
+          comms_send_ctrl(&comms, &ctrl);
+
+          /* Optional quick log:
+          // char buf[96];
+          // int n = snprintf(buf, sizeof(buf), "CTRL uh=%.3f uf=%.3f\r\n", ctrl.uh, ctrl.uf);
+          // if (n > 0) HAL_UART_Transmit(&huart3, (uint8_t*)buf, (uint16_t)n, HAL_MAX_DELAY);
+          */
+      }
+
+      osDelay(10);
   }
   /* USER CODE END 5 */
 }

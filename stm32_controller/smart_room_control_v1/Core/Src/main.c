@@ -56,6 +56,11 @@ const osThreadAttr_t defaultTask_attributes = {
 };
 /* USER CODE BEGIN PV */
 
+volatile meas_packet_t g_last_meas;
+volatile uint32_t      g_meas_seq = 0;
+volatile uint32_t      g_last_meas_tick = 0;
+volatile uint32_t      g_last_meas_age_ms = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -74,11 +79,15 @@ void StartDefaultTask(void *argument);
 static comms_t comms;
 
 static void on_meas_cb(const meas_packet_t *m) {
-    char msg[128];
-    int n = snprintf(msg, sizeof(msg),
-                     "Parsed MEAS: T=%.2f, w=%.2f, c=%.2f, N=%.2f\r\n",
-                     m->T, m->w, m->c, m->N);
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, n, HAL_MAX_DELAY);
+	g_last_meas = *m;
+	g_meas_seq++;
+	g_last_meas_tick = HAL_GetTick();
+
+	char msg[128];
+	int n = snprintf(msg, sizeof(msg),
+					 "Parsed MEAS: T=%.2f, w=%.6f, c=%.1f, N=%.0f\r\n",
+					 m->T, m->w, m->c, m->N);
+	HAL_UART_Transmit(&huart3, (uint8_t*)msg, n, HAL_MAX_DELAY);
 }
 
 /* USER CODE END 0 */
@@ -315,7 +324,7 @@ void StartDefaultTask(void *argument)
 		  last = now;
 		  comms_send_ctrl(&comms, &ctrl);
 	  }
-
+	  g_last_meas_age_ms = now - g_last_meas_tick;
 	  osDelay(10);
   }
   /* USER CODE END 5 */

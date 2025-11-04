@@ -1,93 +1,105 @@
+/**
+ * @file uart_parser.c
+ * @brief Implementation of ASCII MEAS frame parser.
+ */
+
 #include "uart_parser.h"
-#include <string.h>
-#include <stdio.h>
 #include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
 
-#if defined(__has_include)
-#  if __has_include(<strings.h>)
-#    include <strings.h>
-#    define local_strncasecmp strncasecmp
-#  else
-#    define NEED_LOCAL_CI_CMP 1
-#  endif
-#else
-#  define NEED_LOCAL_CI_CMP 1
-#endif
+/* -------------------------------------------------------------------------- */
+/* Internal helpers                                                           */
+/* -------------------------------------------------------------------------- */
 
-#ifdef NEED_LOCAL_CI_CMP
-static int local_strncasecmp(const char *a, const char *b, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        unsigned char ca = (unsigned char)tolower((unsigned char)a[i]);
-        unsigned char cb = (unsigned char)tolower((unsigned char)b[i]);
-        if (ca != cb || ca == '\0' || cb == '\0') return (int)ca - (int)cb;
-    }
-    return 0;
-}
-#endif
-
-static const char *trim(const char *s) {
-    while (*s && isspace((unsigned char)*s)) s++;
+/**
+ * @brief Trim ASCII whitespace from both ends (in-place).
+ * @param s Mutable C-string.
+ * @return Pointer to the first non-space character inside s.
+ */
+static char *trim(char *s) {
+    while (isspace((unsigned char)*s)) s++;
+    if (*s == 0) return s;
+    char *e = s + strlen(s) - 1;
+    while (e > s && isspace((unsigned char)*e)) *e-- = 0;
     return s;
 }
-static void rtrim(char *s) {
-    size_t n = strlen(s);
-    while (n > 0 && isspace((unsigned char)s[n-1])) { s[n-1] = '\0'; n--; }
-}
 
-int parse_meas_line(const char *line, meas_packet_t *out) {
-    if (!line || !out) return -1;
-    out->valid = false;
+/* -------------------------------------------------------------------------- */
+/* Public API                                                                 */
+/* -------------------------------------------------------------------------- */
 
-    const char *start = strchr(line, '<');
-    const char *end   = strrchr(line, '>');
-    if (!start || !end || end <= start) return -2;
+/**
+ * @brief Parse a measurement frame of the form "<MEAS, T, w, c, N>".
+ *
+ * The function extracts the comma-separated fields and converts them to floats.
+ * It is tolerant to extra spaces around commas and tokens.
+ * Returns true only if all five tokens ("MEAS", T, w, c, N) are present
+ * and valid numbers are parsed.
+ *
+ * Example:
+ *   Input: "<MEAS, 20.315, 0.005890, 781.1, 2>"
+ *   Output: out->T=20.315, w=0.005890, c=781.1, N=2
+ *
+ * @param frame  Input ASCII frame including '<' and '>'.
+ * @param out    Output struct with parsed float values.
+ * @return true  On successful parsing.
+ * @return false On invalid syntax or conversion failure.
+ */
+bool uart_parse_meas(const char *frame, meas_packet_t *out) {
+    /* --- Basic validation --- */
+    if (!frame || frame[0] != '<') return false;
+    const char *gt = strrchr(frame, '>');
+    if (!gt) return false;
 
-    size_t len = (size_t)(end - start - 1);
-    if (len == 0 || len > 200) return -3;
+    size_t len = (size_t)(gt - frame - 1);
+    if (len == 0) return false;
+    if (len >= 127) return false;
 
-    char buf[256];
-    memcpy(buf, start + 1, len);
-    buf[len] = '\0';
-    rtrim(buf);
+    /* --- Copy body (between < and >) into a mutable buffer --- */
+    char tmp[128];
+    memcpy(tmp, frame + 1, len);
+    tmp[len] = '\0';
 
-    const char *p = trim(buf);
-    if (local_strncasecmp(p, "MEAS", 4) != 0) return -4;
-    p += 4;
-    while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+    /* --- Tokenize by commas --- */
+    // Expect exactly 5 tokens: "MEAS", T, w, c, N
+    char *tok[5] = {0};
+    size_t ntok = 0;
+    char *p = tmp;
+    char *s = NULL;
 
-    float vals[4];
-    int idx = 0;
-    while (*p && idx < 4) {
-        char tok[64];
-        int ti = 0;
-        while (*p && *p != ',') {
-            if (ti < (int)sizeof(tok) - 1) tok[ti++] = *p;
-            p++;
-        }
-        tok[ti] = '\0';
-        if (*p == ',') p++;
-
-        const char *t = trim(tok);
-        char *endptr = NULL;
-        float v = strtof(t, &endptr);
-        if (endptr == t) return -5;
-        vals[idx++] = v;
+    while (ntok < 4 && (s = strchr(p, ',')) != NULL) {
+        *s = '\0';                  // terminate current token
+        tok[ntok++] = trim(p);      // store trimmed token
+        p = s + 1;                  // advance past comma
     }
-    if (idx != 4) return -6;
+    // Add final token (after last comma)
+    tok[ntok++] = trim(p);
 
-    out->T = vals[0];
-    out->w = vals[1];
-    out->c = vals[2];
-    out->N = vals[3];
-    out->valid = true;
-    return 0;
-}
+    if (ntok != 5) return false;
 
-int format_ctrl_packet(const ctrl_packet_t *in, char *buf, size_t buflen) {
-    if (!in || !buf || buflen == 0) return -1;
-    float uh = in->uh; if (uh < 0.f) uh = 0.f; if (uh > 1.f) uh = 1.f;
-    float uf = in->uf; if (uf < 0.f) uf = 0.f; if (uf > 1.f) uf = 1.f;
-    int n = snprintf(buf, buflen, "<CTRL, %.3f, %.3f>\r\n", uh, uf);
-    if (n < 0 || (size_t)n >= buflen) return -2;
-    return n;
+    /* --- Validate the first token ("MEAS") --- */
+    const char *k = tok[0];
+    const char *m = "MEAS";
+    size_t i = 0;
+    for (; m[i] && k[i]; ++i) {
+        if (toupper((unsigned char)m[i]) != toupper((unsigned char)k[i]))
+            break;
+    }
+    if (m[i] || k[i]) return false; // mismatch
+
+    /* --- Convert remaining tokens to floats --- */
+    char *endp = NULL;
+    float T = strtof(tok[1], &endp); if (endp == tok[1]) return false;
+    float w = strtof(tok[2], &endp); if (endp == tok[2]) return false;
+    float c = strtof(tok[3], &endp); if (endp == tok[3]) return false;
+    float N = strtof(tok[4], &endp); if (endp == tok[4]) return false;
+
+    /* --- Assign outputs --- */
+    out->T = T;
+    out->w = w;
+    out->c = c;
+    out->N = N;
+
+    return true;
 }

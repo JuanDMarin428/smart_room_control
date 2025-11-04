@@ -99,46 +99,64 @@ static inline float q_flow(float uf, float T, float To){
     return q_max * clampf(uf,0,1) + k_stack*(T - To);
 }
 
+static volatile bool g_send_kf_frames = true;
+static inline void set_send_kf_frames(bool enable) { g_send_kf_frames = enable; }
+
+/**
+ * @brief Measurement callback: linearize model, run 3-state KF, publish filtered values,
+ *        and optionally transmit a machine-parsable KF frame "<KF,T,w,c,N>\r\n".
+ *
+ * Steps:
+ *  1) Compute dt since last callback.
+ *  2) Build inputs and disturbances (N filtered via 1D KF).
+ *  3) Linearize f(x,u,d) around current estimate x = [T, w, c] to form discrete A,B,E.
+ *  4) Kalman predict/update with z = [T, w, c] measured.
+ *  5) Publish filtered values. Optionally TX "<KF,...>" if g_send_kf_frames = true.
+ *
+ * UART output:
+ *  - Human-readable log: "MEAS ... | KF ..."
+ *  - Optional machine-parsable: "<KF,T,w,c,N>\r\n"
+ */
 static void on_meas_cb(const meas_packet_t *m) {
     g_last_meas = *m;
 
-    // 1) dt desde último MEAS
+    /* 1) Time step [s] */
     uint32_t now = HAL_GetTick();
-    float dt = (now - last_kf_tick) * 0.001f;            // [s]
-    if (dt < 1e-3f) dt = 1e-3f; if (dt > 60.0f) dt = 60.0f;
+    float dt = (now - last_kf_tick) * 0.001f;
+    if (dt < 1e-3f) dt = 1e-3f;
+    if (dt > 60.0f) dt = 60.0f;
     last_kf_tick = now;
 
-    // 2) Entradas y disturbios (usa tus últimas consignas reales)
-    //    Aquí pongo ctrl fijo por simplicidad; usa tus variables reales uh/uf.
-    float u[2] = { 0.5f, 0.25f };      // [u_h, u_f] (reemplaza por actuales)
-    float To = 10.0f, wo = 0.004f, co = 420.0f; // reemplaza si tienes medición real
+    /* 2) Inputs and disturbances (replace with live signals if available) */
+    float u[2] = { 0.5f, 0.25f };             /* [u_h, u_f] */
+    float To = 10.0f, wo = 0.004f, co = 420.0f;
 
-    // N filtrado (usa medición actual m->N como zN)
+    /* N filtering (current measurement as observation) */
     float Nhat = kf1d_update(&kfN, m->N);
     float d[4] = { To, wo, co, Nhat };
 
-    // 3) Construir A,B,E alrededor del estado estimado actual kf.x
+    /* 3) Linearization around current estimate x = [T, w, c] */
     const float T = kf.x[0], w = kf.x[1], c = kf.x[2];
     float q = q_flow(u[1], T, To);
     float alpha = q / V;
     float beta  = k_stack / V;
 
-    // dfdx
+    /* dfdx */
     float dfdx[3][3] = {
         { -alpha + beta*(To - T),  0.0f,                   0.0f },
         {  beta*(wo - w),         -alpha,                 0.0f },
         {  beta*(co - c),          0.0f,                 -alpha }
     };
 
-    // dfdu (u=[uh, uf])
+    /* dfdu, u=[uh, uf] */
     float dfdu[3][2] = {0};
-    dfdu[0][0] = (eta_h*Ph)/(rho*cp*V); // efecto del heater en T
-    float kv = (q_max)/V;               // derivada de q respecto a uf
+    dfdu[0][0] = (eta_h*Ph)/(rho*cp*V);
+    float kv = (q_max)/V;   /* dq/duf scaled by volume */
     dfdu[0][1] = kv*(To - T);
     dfdu[1][1] = kv*(wo - w);
     dfdu[2][1] = kv*(co - c);
 
-    // dfdd (d=[To, wo, co, N])
+    /* dfdd, d=[To, wo, co, N] */
     float dfdd[3][4] = {0};
     dfdd[0][0] =  alpha - beta*(To - T);
     dfdd[1][0] = -beta*(wo - w);
@@ -149,7 +167,7 @@ static void on_meas_cb(const meas_packet_t *m) {
     dfdd[1][3] = (G_w)/(rho*V);
     dfdd[2][3] = gamma_c;
 
-    // A = I + dt*dfdx ; B = dt*dfdu ; E = dt*dfdd
+    /* Discrete model: A = I + dt*dfdx ; B = dt*dfdu ; E = dt*dfdd */
     float A[3][3] = {
         {1.0f + dt*dfdx[0][0], dt*dfdx[0][1],            dt*dfdx[0][2]},
         {dt*dfdx[1][0],        1.0f + dt*dfdx[1][1],     dt*dfdx[1][2]},
@@ -166,10 +184,10 @@ static void on_meas_cb(const meas_packet_t *m) {
         {dt*dfdd[2][0], dt*dfdd[2][1], dt*dfdd[2][2], dt*dfdd[2][3]}
     };
 
-    // 4) Kalman: predicción y actualización con z = [T,w,c] medidos
+    /* 4) Kalman filter (z = measured states) */
     float z[3] = { m->T, m->w, m->c };
     if (!kf.inited) {
-        float x0[3] = { z[0], z[1], z[2] };
+        float x0[3]    = { z[0], z[1], z[2] };
         float Rdiag[3] = { 0.01f, 1e-8f, 400.0f };
         float Qdiag[3] = { 4e-4f, 1e-8f, 25.0f };
         kf3_init(&kf, x0, 1.0f, Qdiag, Rdiag);
@@ -178,7 +196,7 @@ static void on_meas_cb(const meas_packet_t *m) {
         kf3_update(&kf, z);
     }
 
-    // 5) Publica filtrado
+    /* 5) Publish filtered values */
     g_filt_meas.T = kf.x[0];
     g_filt_meas.w = kf.x[1];
     g_filt_meas.c = kf.x[2];
@@ -187,14 +205,30 @@ static void on_meas_cb(const meas_packet_t *m) {
     g_last_meas_tick = now;
     g_meas_seq++;
 
-    // (Opcional) log
-    char msg[192];
-    int n = snprintf(msg, sizeof(msg),
-        "MEAS T=%.3f w=%.6f c=%.1f N=%.0f | KF T=%.3f w=%.6f c=%.1f N=%.2f\r\n",
-        m->T, m->w, m->c, m->N,
-        g_filt_meas.T, g_filt_meas.w, g_filt_meas.c, g_filt_meas.N);
-    if (n>0) HAL_UART_Transmit(&huart3, (uint8_t*)msg, (uint16_t)n, HAL_MAX_DELAY);
+    /* Human-readable log (kept) */
+    {
+        char msg[192];
+        int n = snprintf(msg, sizeof(msg),
+            "MEAS T=%.3f w=%.6f c=%.1f N=%.0f | KF T=%.3f w=%.6f c=%.1f N=%.2f\r\n",
+            m->T, m->w, m->c, m->N,
+            g_filt_meas.T, g_filt_meas.w, g_filt_meas.c, g_filt_meas.N);
+        if (n > 0) {
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, (uint16_t)n, HAL_MAX_DELAY);
+        }
+    }
+
+    /* Optional machine-parsable KF frame: "<KF,T,w,c,N>\r\n" */
+    if (g_send_kf_frames) {
+        char kf_frame[96];
+        int k = snprintf(kf_frame, sizeof(kf_frame),
+                         "<KF,%.3f,%.6f,%.1f,%.2f>\r\n",
+                         g_filt_meas.T, g_filt_meas.w, g_filt_meas.c, g_filt_meas.N);
+        if (k > 0) {
+            HAL_UART_Transmit(&huart3, (uint8_t*)kf_frame, (uint16_t)k, HAL_MAX_DELAY);
+        }
+    }
 }
+
 
 
 /* USER CODE END 0 */

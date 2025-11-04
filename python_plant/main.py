@@ -59,6 +59,9 @@ def parse_args():
                     help='Multiplier for fan max flow q_max')
     ap.add_argument('--sim-speed', type=float, default=1.0,
                     help='Simulated seconds per real second (time acceleration)')
+    ap.add_argument('--noise-mult-T', type=float, default=1.0, help='Multiplier for T sensor noise std')
+    ap.add_argument('--noise-mult-w', type=float, default=1.0, help='Multiplier for w sensor noise std')
+    ap.add_argument('--noise-mult-c', type=float, default=1.0, help='Multiplier for CO2 sensor noise std')
     return ap.parse_args()
 
 
@@ -67,7 +70,7 @@ class LivePlot:
     LivePlot class
     --------------
     Displays each variable in its own subplot with a shared X-axis (time).
-    This provides clear separation between temperature, humidity, CO2, etc.
+    Shows sensor (solid), KF from MCU (dashed), and true model values (dotted).
     """
 
     def __init__(self, window_samples: int = 600):
@@ -82,6 +85,16 @@ class LivePlot:
         self.uh = deque(maxlen=window_samples)
         self.uf = deque(maxlen=window_samples)
 
+        # KF (from STM32) buffers
+        self.T_kf = deque(maxlen=window_samples)
+        self.w_kf = deque(maxlen=window_samples)
+        self.c_kf = deque(maxlen=window_samples)
+
+        # True (from model) buffers
+        self.T_true = deque(maxlen=window_samples)
+        self.w_true = deque(maxlen=window_samples)
+        self.c_true = deque(maxlen=window_samples)
+
         # Create subplots (one row per variable)
         self.fig, self.axes = plt.subplots(6, 1, figsize=(10, 10), sharex=True)
         self.fig.suptitle("Smart Room Live Signals", fontsize=14)
@@ -93,6 +106,16 @@ class LivePlot:
         self.l_RH, = self.axes[3].plot([], [], label="RH [%]", color="tab:orange")
         self.l_uh, = self.axes[4].plot([], [], label="uh (heater)", color="tab:purple")
         self.l_uf, = self.axes[5].plot([], [], label="uf (fan)", color="tab:brown")
+
+        # KF overlay lines (dashed).
+        self.l_T_kf,  = self.axes[0].plot([], [], linestyle="--", label="T KF [°C]")
+        self.l_w_kf,  = self.axes[1].plot([], [], linestyle="--", label="w KF [kg/kg]")
+        self.l_c_kf,  = self.axes[2].plot([], [], linestyle="--", label="CO₂ KF [ppm]")
+
+        # True overlay (dotted)
+        self.l_T_true,  = self.axes[0].plot([], [], linestyle=":",  label="T true [°C]")
+        self.l_w_true,  = self.axes[1].plot([], [], linestyle=":",  label="w true [kg/kg]")
+        self.l_c_true,  = self.axes[2].plot([], [], linestyle=":",  label="CO₂ true [ppm]")
 
         # Configure each subplot
         labels = ["Temperature", "Abs. Humidity", "CO₂", "Relative Humidity", "Heater Duty", "Fan Duty"]
@@ -109,20 +132,27 @@ class LivePlot:
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         plt.show(block=False)
 
-    def update(self, t, T, w, c, RH, uh, uf):
-        """Append a new sample and refresh all subplots."""
-        # Add new values to buffers
+    def update(self, t, T, w, c, RH, uh, uf,
+               T_kf=None, w_kf=None, c_kf=None,
+               T_true=None, w_true=None, c_true=None):
+        # Buffers base
         self.t.append(t)
-        self.T.append(T)
-        self.w.append(w)
-        self.c.append(c)
-        self.RH.append(RH)
-        self.uh.append(uh)
-        self.uf.append(uf)
+        self.T.append(T); self.w.append(w); self.c.append(c); self.RH.append(RH)
+        self.uh.append(uh); self.uf.append(uf)
+
+        # KF (append only if provided)
+        if T_kf is not None: self.T_kf.append(T_kf)
+        if w_kf is not None: self.w_kf.append(w_kf)
+        if c_kf is not None: self.c_kf.append(c_kf)
+
+        # True (append only if provided)
+        if T_true is not None: self.T_true.append(T_true)
+        if w_true is not None: self.w_true.append(w_true)
+        if c_true is not None: self.c_true.append(c_true)
 
         x = list(self.t)
 
-        # Update each line plot
+        # Update raw lines
         self.l_T.set_data(x, list(self.T))
         self.l_w.set_data(x, list(self.w))
         self.l_c.set_data(x, list(self.c))
@@ -130,10 +160,25 @@ class LivePlot:
         self.l_uh.set_data(x, list(self.uh))
         self.l_uf.set_data(x, list(self.uf))
 
-        # Autoscale Y and set X limits
+        # Update KF lines (only if we have any samples)
+        if len(self.T_kf) > 0:
+            self.l_T_kf.set_data(x[-len(self.T_kf):], list(self.T_kf))
+        if len(self.w_kf) > 0:
+            self.l_w_kf.set_data(x[-len(self.w_kf):], list(self.w_kf))
+        if len(self.c_kf) > 0:
+            self.l_c_kf.set_data(x[-len(self.c_kf):], list(self.c_kf))
+
+        # True lines (only if we have any samples)
+        if len(self.T_true) > 0:
+            self.l_T_true.set_data(x[-len(self.T_true):], list(self.T_true))
+        if len(self.w_true) > 0:
+            self.l_w_true.set_data(x[-len(self.w_true):], list(self.w_true))
+        if len(self.c_true) > 0:
+            self.l_c_true.set_data(x[-len(self.c_true):], list(self.c_true))
+
+        # Autoscale and redraw
         for ax, data in zip(self.axes, [self.T, self.w, self.c, self.RH, self.uh, self.uf]):
-            ax.relim()
-            ax.autoscale_view()
+            ax.relim(); ax.autoscale_view()
             ax.set_xlim(x[0], x[-1] if len(x) > 1 else 1)
 
         self.fig.canvas.draw()
@@ -147,11 +192,12 @@ def main():
     # Initialize model and disturbances
     mdl = SmartRoomModel(
         Ts=args.Ts,
-        time_scale=args.sim_speed,           
-        heater_scale=args.heater_scale,      
-        fan_scale=args.fan_scale             
+        time_scale=args.sim_speed,
+        heater_scale=args.heater_scale,
+        fan_scale=args.fan_scale
     )
     mdl.set_disturbances(args.To, args.wo, args.co, args.N)
+    mdl.set_noise_multipliers(T=args.noise_mult_T, w=args.noise_mult_w, c=args.noise_mult_c)
 
     # UART manager (only in online mode)
     ser: Optional[SerialManager] = None
@@ -168,8 +214,14 @@ def main():
     csv_path = Path(args.logdir) / f"run_{timestamp}.csv"
     f = open(csv_path, 'w', newline='')
     writer = csv.writer(f)
-    writer.writerow(['t_sim', 'T', 'w', 'c', 'RH', 'uh', 'uf', 'N', 'To', 'wo', 'co', 'mode',
-                     'heater_scale', 'fan_scale', 'sim_speed'])
+    writer.writerow([
+        't_sim',
+        'T_meas','w_meas','c_meas','RH',
+        'T_kf','w_kf','c_kf',
+        'T_true','w_true','c_true',
+        'uh','uf','N','To','wo','co','mode',
+        'heater_scale','fan_scale','sim_speed'
+    ])
     # Initial control values (heater, fan)
     uh, uf = float(args.init_uh), float(args.init_uf)
 
@@ -186,31 +238,61 @@ def main():
     print(f"Logging to: {csv_path}")
 
     try:
-        while t_sim  <= t_end:
+        # Initialize KF overlay vars
+        T_kf = w_kf = c_kf = None
+
+        while t_sim <= t_end:
+            # Reset KF overlays for this iteration
+            T_kf = w_kf = c_kf = None
+
             # (1) Step model
             _ = mdl.step(uh, uf)
             meas = mdl.measure(add_noise=True)  # returns dict: T, w, c, RH
+            x_true = mdl.get_state()            # true model state
 
             # (2) STM32 communication (if online)
             if online and ser is not None:
+                # 2.1) Send measurement with noise
                 try:
                     ser.send_meas(meas['T'], meas['w'], meas['c'], args.N)
-                    ctrl: Optional[Tuple[float, float]] = ser.recv_ctrl()
+                except Exception as e:
+                    print(f"[WARN] UART send failed: {e}")
+                # 2.2) Read control if available (non-blocking)
+                try:
+                    ctrl = ser.recv_ctrl_nowait()
                     if ctrl is not None:
                         uh_new, uf_new = ctrl
                         uh = min(max(uh_new, 0.0), 1.0)
                         uf = min(max(uf_new, 0.0), 1.0)
-                except Exception as e:
-                    print(f"[WARN] UART step failed: {e}")
+                except Exception:
+                    pass
+                # 2.3) Read KF if available (non-blocking)
+                try:
+                    kf_pkt = ser.recv_kf_nowait()  # (T,w,c,N)
+                    if kf_pkt is not None:
+                        T_kf, w_kf, c_kf, _ = kf_pkt
+                except Exception:
+                    pass
 
             # (3) Log to CSV
-            writer.writerow([t_sim, meas['T'], meas['w'], meas['c'], meas['RH'],
-                             uh, uf, args.N, args.To, args.wo, args.co, args.mode,
-                             args.heater_scale, args.fan_scale, args.sim_speed])
+            writer.writerow([
+                t_sim,
+                meas['T'], meas['w'], meas['c'], meas['RH'],
+                T_kf, w_kf, c_kf,
+                x_true['T'], x_true['w'], x_true['c'],
+                uh, uf, args.N, args.To, args.wo, args.co, args.mode,
+                args.heater_scale, args.fan_scale, args.sim_speed
+            ])
 
             # (4) Live plotting
             if live is not None:
-                live.update(t_sim, meas['T'], meas['w'], meas['c'], meas['RH'], uh, uf)
+                live.update(
+                    t_sim,
+                    meas['T'], meas['w'], meas['c'], meas['RH'],
+                    uh, uf,
+                    T_kf=T_kf, w_kf=w_kf, c_kf=c_kf,
+                    T_true=x_true['T'], w_true=x_true['w'], c_true=x_true['c']
+                )
 
             # (5) Timing control
             next_time += mdl.Ts

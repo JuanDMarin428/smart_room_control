@@ -79,6 +79,18 @@ class SmartRoomModel:
             "c": 20.0        # ppm
         }
 
+        self.noise_mult = {
+            "T": 1.0,
+            "w": 1.0,
+            "c": 1.0
+        }
+
+    def set_noise_multipliers(self, T: float = 1.0, w: float = 1.0, c: float = 1.0) -> None:
+        """Scale the measurement noise std-devs by given multipliers."""
+        self.noise_mult["T"] = float(max(T, 0.0))
+        self.noise_mult["w"] = float(max(w, 0.0))
+        self.noise_mult["c"] = float(max(c, 0.0))
+
     # ---------- Helpers ----------
     def q_flow(self, u_f: float, T: float, To: float) -> float:
         """Total airflow [m^3/s] as fan + stack effect."""
@@ -132,10 +144,10 @@ class SmartRoomModel:
     def measure(self, add_noise: bool = True) -> Dict[str, Optional[float]]:
         """Return a dict with sensor readings. Includes RH for convenience."""
         T, w, c = self.x
-        mT = float(T + (self.rng.normal(0, self.noise_std['T']) if add_noise else 0.0))
-        mw = float(w + (self.rng.normal(0, self.noise_std['w']) if add_noise else 0.0))
+        mT = float(T + (self.rng.normal(0, self.noise_std['T'] * self.noise_mult['T']) if add_noise else 0.0))
+        mw = float(w + (self.rng.normal(0, self.noise_std['w'] * self.noise_mult['w']) if add_noise else 0.0))
         if self.sensor_co2:
-            mc = float(c + (self.rng.normal(0, self.noise_std['c']) if add_noise else 0.0))
+            mc = float(c + (self.rng.normal(0, self.noise_std['c'] * self.noise_mult['c']) if add_noise else 0.0))
         else:
             mc = None
         RH = self.rh_from_Tw(mT, mw)

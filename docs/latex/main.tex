@@ -1,0 +1,225 @@
+\documentclass[12pt,a4paper]{article}
+
+% ---------- Packages ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{margin=1in}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue,
+}
+
+% ---------- Code formatting ----------
+\lstset{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!5},
+    numbers=left,
+    numberstyle=\tiny,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{orange},
+    tabsize=4
+}
+
+% ---------- Document ----------
+\begin{document}
+
+\title{Smart Room Control System\\
+\large Modeling, Simulation and Embedded Control using STM32 and Python}
+\author{Author: \textbf{Juan Marin} \\ Institution: ASIMOV}
+\date{\today}
+\maketitle
+ 
+\begin{abstract}
+This document describes the design, modeling and implementation of a closed-room environmental control system. 
+The physical plant (temperature, humidity and CO$_2$) is simulated in Python, while the control algorithm 
+(Kalman Filter and Model Predictive Control) runs on an STM32F767ZI microcontroller. 
+Both systems communicate through UART over USB. A graphical interface allows real-time visualization 
+and modification of temperature, humidity and CO$_2$ setpoints.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction}
+This project aims to design a smart indoor climate control system with a realistic yet computationally simple dynamic model. 
+The goal is to maintain comfortable levels of temperature, humidity and CO$_2$ concentration using two actuators: 
+an electric heater and a ventilation fan.
+
+\subsection{System Overview}
+The system consists of:
+\begin{itemize}
+    \item \textbf{Python Plant:} Simulates environmental dynamics and sensors.
+    \item \textbf{STM32 Controller:} Runs estimation (Kalman Filter) and MPC control.
+    \item \textbf{UART Communication:} Transfers measurements and control signals.
+    \item \textbf{Graphical User Interface:} Displays real-time data and allows user interaction.
+\end{itemize}
+
+% ============================================================
+\section{Physical Model and State Variables}
+The room is modeled as a well-mixed air volume. 
+The state vector is defined as:
+\[
+x = 
+\begin{bmatrix}
+T \\ w \\ c
+\end{bmatrix}
+\]
+where:
+\begin{itemize}
+    \item $T$ [°C] — air temperature
+    \item $w$ [kg/kg] — absolute humidity
+    \item $c$ [ppm] — CO$_2$ concentration
+\end{itemize}
+
+The control inputs are:
+\[
+u =
+\begin{bmatrix}
+u_h \\ u_f
+\end{bmatrix}
+\]
+where $u_h$ and $u_f$ represent heater and fan PWM duty cycles respectively.
+
+Disturbances include outdoor air conditions and occupancy:
+\[
+d =
+\begin{bmatrix}
+T_o \\ w_o \\ c_o \\ N
+\end{bmatrix}
+\]
+
+% ============================================================
+\section{Mathematical Modeling}
+\subsection{Continuous-Time Dynamics}
+\begin{align}
+\dot{T} &= \frac{q}{V}(T_o - T) + \frac{\eta_h P_h}{\rho c_p V}u_h + \frac{Q_{pers}}{\rho c_p V}N \\
+\dot{w} &= \frac{q}{V}(w_o - w) + \frac{G_w}{\rho V}N \\
+\dot{c} &= \frac{q}{V}(c_o - c) + \gamma_c N
+\end{align}
+
+where:
+\begin{itemize}
+    \item $q = q_{max} u_f + k_{stack}(T - T_o)$ is the total airflow (m³/s)
+    \item $V$ is the room volume
+    \item $\rho$ and $c_p$ are air density and heat capacity
+    \item $\eta_h P_h$ is the effective heater power
+    \item $Q_{pers}, G_w, \gamma_c$ represent heat, moisture and CO$_2$ generation per person
+\end{itemize}
+
+\subsection{Discretization}
+Using forward Euler with sample time $T_s$:
+\[
+x_{k+1} = x_k + T_s \, f(x_k, u_k, d_k)
+\]
+
+\subsection{Linearization}
+Around an operating point $(x^*, u^*, d^*)$:
+\[
+\delta x_{k+1} = A\delta x_k + B\delta u_k + E\delta d_k
+\]
+The matrices $A$, $B$, and $E$ are obtained from the Jacobians of $f(x,u,d)$.
+
+% ============================================================
+\section{Python Plant Implementation}
+The plant simulation will be written in Python. It will:
+\begin{itemize}
+    \item Update the states using the discrete model.
+    \item Add measurement noise to emulate real sensors.
+    \item Send measurements to STM32 via UART.
+    \item Receive control signals ($u_h$, $u_f$) and apply them.
+\end{itemize}
+
+Example Python structure:
+\begin{lstlisting}[language=Python, caption={Basic structure of the plant model.}]
+def q_flow(u_f, T, To):
+    return q_max * u_f + k_stack * (T - To)
+
+def f_cont(x, u, d):
+    T, w, c = x
+    uh, uf = u
+    To, wo, co, N = d
+    q = q_flow(uf, T, To)
+    alpha = q / V
+    dT = alpha*(To - T) + (eta_h*Ph)/(rho*cp*V)*uh + (Q_person)/(rho*cp*V)*N
+    dw = alpha*(wo - w) + (G_w)/(rho*V)*N
+    dc = alpha*(co - c) + gamma_c*N
+    return np.array([dT, dw, dc])
+\end{lstlisting}
+
+% ============================================================
+\section{Embedded Controller (STM32F767ZI)}
+\subsection{Overview}
+The STM32 firmware will:
+\begin{enumerate}
+    \item Receive sensor data via UART.
+    \item Estimate states with a discrete Kalman Filter.
+    \item Compute control actions using MPC.
+    \item Send PWM values back to Python.
+\end{enumerate}
+
+\subsection{Communication Protocol (UART over USB)}
+\begin{itemize}
+    \item Baud rate: 115200 bps
+    \item Format: JSON or comma-separated ASCII packets
+    \item Direction:
+    \begin{itemize}
+        \item Python → STM32: $T, w, c, N$
+        \item STM32 → Python: $u_h, u_f$
+    \end{itemize}
+\end{itemize}
+
+Example packet:
+\begin{verbatim}
+<MEAS, 22.4, 0.0062, 750, 2>
+<CTRL, 0.45, 0.70>
+\end{verbatim}
+
+% ============================================================
+\section{Graphical User Interface}
+The GUI (Python) will:
+\begin{itemize}
+    \item Display time-series plots for $T$, $w$, and $c$.
+    \item Show heater and fan PWM signals.
+    \item Allow user to set target values (setpoints).
+    \item Start/stop the simulation.
+\end{itemize}
+
+Potential tools: \texttt{PyQt5}, \texttt{Tkinter}, or \texttt{Streamlit}.
+
+% ============================================================
+\section{Integration and Testing}
+\begin{itemize}
+    \item Verify UART data integrity.
+    \item Validate the model by comparing simulated and real dynamics.
+    \item Tune Kalman Filter noise matrices $Q$ and $R$.
+    \item Tune MPC weights for comfort vs. energy trade-off.
+\end{itemize}
+
+% ============================================================
+\section{Conclusions and Future Work}
+This document establishes the foundation for implementing a closed-loop 
+environmental control system using hybrid simulation and embedded hardware. 
+Next steps include GUI integration, experimental validation, and possible 
+extension to multi-zone or networked control systems.
+
+% ============================================================
+\bibliographystyle{ieeetr}
+\bibliography{references}
+
+\end{document}

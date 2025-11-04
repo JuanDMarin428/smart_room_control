@@ -1,0 +1,16 @@
+* text=auto
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.ld text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.tex text eol=lf
+
+# Trata binarios como tales
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary

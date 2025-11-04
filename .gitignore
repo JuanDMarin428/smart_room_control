@@ -1,0 +1,58 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.build/
+dist/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.env
+.env.*
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+logs/
+**/logs/
+
+# --- LaTeX ---
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+*.toc
+*.out
+*.lof
+*.lot
+*.lox
+
+# --- STM32CubeIDE / Eclipse build output ---
+**/Debug/
+**/Release/
+**/build/
+**/cmake-build*/
+# Archivos temporales de CubeMX/IDE que no aportan
+**/.settings/
+**/*.launch
+**/*.uvoptx
+**/*.uvprojx
+# Generados de codegen que cambian de versión
+**/.mxproject
+# Artefactos varios
+*.swp
+*.swo
+
+# --- Misc ---
+*.bak
+*.tmp
